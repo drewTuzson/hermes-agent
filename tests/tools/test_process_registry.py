@@ -951,7 +951,11 @@ def test_format_completion_event():
     assert "[IMPORTANT: Background process proc_abc completed" in result
     assert "exit code 0" in result
     assert "Command: sleep 5" in result
-    assert "Output:\ndone]" in result
+    assert "Output:\ndone" in result
+    assert "Plain-English Summary:" in result
+    assert "Where things stand:" in result
+    assert "What Drew needs:" in result
+    assert "Next move:" in result
 
 
 def test_format_watch_match_event():
@@ -966,6 +970,7 @@ def test_format_watch_match_event():
     result = format_process_notification(evt)
     assert 'watch pattern "ERROR"' in result
     assert "Matched output:\nERROR: disk full" in result
+    assert "Plain-English Summary:" in result
 
 
 def test_format_watch_match_with_suppressed():
@@ -988,6 +993,7 @@ def test_format_watch_disabled_event():
     }
     result = format_process_notification(evt)
     assert "[IMPORTANT: Watch disabled for proc_xyz" in result
+    assert "Plain-English Summary:" in result
 
 
 def test_format_returns_none_for_empty_event():

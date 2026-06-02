@@ -562,31 +562,41 @@ class TestDiscoverFallbackIps:
         assert ips == ["149.154.167.220"]
 
     @pytest.mark.asyncio
-    async def test_doh_timeout_falls_back_to_seed(self, monkeypatch):
+    async def test_doh_timeout_uses_system_dns_before_seed(self, monkeypatch):
         self._patch_doh(monkeypatch, {
             "https://dns.google": httpx.TimeoutException("timeout"),
             "https://cloudflare-dns.com": httpx.TimeoutException("timeout"),
         }, system_dns_ips=["149.154.166.110"])
 
         ips = await tnet.discover_fallback_ips()
-        assert ips == tnet._SEED_FALLBACK_IPS
+        assert ips == ["149.154.166.110"]
 
     @pytest.mark.asyncio
-    async def test_doh_connect_error_falls_back_to_seed(self, monkeypatch):
+    async def test_doh_connect_error_uses_system_dns_before_seed(self, monkeypatch):
         self._patch_doh(monkeypatch, {
             "https://dns.google": httpx.ConnectError("refused"),
             "https://cloudflare-dns.com": httpx.ConnectError("refused"),
         }, system_dns_ips=["149.154.166.110"])
 
         ips = await tnet.discover_fallback_ips()
-        assert ips == tnet._SEED_FALLBACK_IPS
+        assert ips == ["149.154.166.110"]
 
     @pytest.mark.asyncio
-    async def test_doh_malformed_json_falls_back_to_seed(self, monkeypatch):
+    async def test_doh_malformed_json_uses_system_dns_before_seed(self, monkeypatch):
         self._patch_doh(monkeypatch, {
             "https://dns.google": (200, {"Status": 0}),  # no Answer key
             "https://cloudflare-dns.com": (200, {"garbage": True}),
         }, system_dns_ips=["149.154.166.110"])
+
+        ips = await tnet.discover_fallback_ips()
+        assert ips == ["149.154.166.110"]
+
+    @pytest.mark.asyncio
+    async def test_doh_failure_without_system_dns_falls_back_to_seed(self, monkeypatch):
+        self._patch_doh(monkeypatch, {
+            "https://dns.google": httpx.TimeoutException("timeout"),
+            "https://cloudflare-dns.com": httpx.TimeoutException("timeout"),
+        }, system_dns_ips=None)
 
         ips = await tnet.discover_fallback_ips()
         assert ips == tnet._SEED_FALLBACK_IPS

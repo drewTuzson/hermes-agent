@@ -174,6 +174,15 @@ def atomic_yaml_write(
             (e.g. commented-out sections for user reference).
     """
     path = Path(path)
+    # Trust-boundary pre-write guard: refuse changes to guarded permission keys on the
+    # authoritative config.yaml unless a valid root-owned marker authorizes them. Only
+    # fires for config.yaml; all other YAML writes pass. Lazy import avoids a circular
+    # import via hermes_cli.config.
+    try:
+        from agent.config_write_policy import assert_write_allowed
+        assert_write_allowed(path, data)
+    except ImportError:
+        pass
     path.parent.mkdir(parents=True, exist_ok=True)
 
     original_mode = _preserve_file_mode(path)
@@ -219,6 +228,18 @@ def atomic_roundtrip_yaml_update(
     from ruamel.yaml.comments import CommentedMap
 
     path = Path(path)
+    # Trust-boundary pre-write guard (single-key path). See atomic_yaml_write.
+    try:
+        from agent.config_write_policy import assert_write_allowed
+        _guard_doc: dict = {}
+        _gc = _guard_doc
+        _gk = key_path.split(".")
+        for _gp in _gk[:-1]:
+            _gc = _gc.setdefault(_gp, {})
+        _gc[_gk[-1]] = value
+        assert_write_allowed(path, _guard_doc)
+    except ImportError:
+        pass
     path.parent.mkdir(parents=True, exist_ok=True)
 
     yaml_rt = YAML(typ="rt")

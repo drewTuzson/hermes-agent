@@ -7544,6 +7544,129 @@ def _update_via_zip(args):
     _kill_stale_dashboard_processes()
 
 
+def _is_sensitive_untracked_update_path(relpath: str) -> bool:
+    """Return True when an untracked path should not be captured in an update patch.
+
+    The pre-update patch is meant to preserve local source-code edits across
+    ``hermes update``.  Untracked files are often tests or new modules, but they
+    can also be local secrets.  Skip obvious credential-shaped paths instead of
+    copying them into ``~/.hermes/update-backups``.
+    """
+    parts = [p.lower() for p in Path(relpath).parts]
+    name = parts[-1] if parts else relpath.lower()
+    if name.startswith(".env") or name in {
+        "auth.json",
+        "config.yaml",
+        "credentials.json",
+        "token.json",
+        "secrets.json",
+    }:
+        return True
+    sensitive_markers = ("secret", "credential", "password", "token", "apikey", "api_key")
+    if any(marker in name for marker in sensitive_markers):
+        return True
+    sensitive_suffixes = (".pem", ".key", ".p12", ".pfx", ".crt", ".cer")
+    return name.endswith(sensitive_suffixes)
+
+
+def _untracked_paths_from_porcelain(status_text: str) -> list[str]:
+    """Extract untracked paths from ``git status --porcelain`` output."""
+    paths: list[str] = []
+    for raw_line in status_text.splitlines():
+        if not raw_line.startswith("?? "):
+            continue
+        relpath = raw_line[3:].strip()
+        if relpath:
+            paths.append(relpath)
+    return paths
+
+
+def _capture_local_update_patch(
+    git_cmd: list[str],
+    cwd: Path,
+    status_text: str,
+) -> Optional[Path]:
+    """Save a best-effort patch of local repo changes before ``hermes update``.
+
+    Git stash is still used for the live update flow, but a stash can be hard to
+    inspect or recover after a failed/conflicted restore.  This patch is a plain
+    file safety handle that captures tracked changes plus safe untracked files
+    before the updater mutates the checkout.
+    """
+    if not status_text.strip():
+        return None
+
+    backup_dir = get_hermes_home() / "update-backups"
+    chunks: list[str] = []
+    try:
+        tracked = subprocess.run(
+            git_cmd + ["diff", "HEAD", "--binary"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if tracked.returncode == 0 and tracked.stdout:
+            chunks.append(tracked.stdout)
+    except Exception:
+        pass
+
+    skipped: list[str] = []
+    for relpath in _untracked_paths_from_porcelain(status_text):
+        if _is_sensitive_untracked_update_path(relpath):
+            skipped.append(relpath)
+            continue
+        path = cwd / relpath
+        candidate_paths: list[Path]
+        if path.is_file():
+            candidate_paths = [path]
+        elif path.is_dir():
+            candidate_paths = [p for p in sorted(path.rglob("*")) if p.is_file()]
+        else:
+            continue
+        for candidate in candidate_paths:
+            file_relpath = candidate.relative_to(cwd).as_posix()
+            if _is_sensitive_untracked_update_path(file_relpath):
+                skipped.append(file_relpath)
+                continue
+            try:
+                untracked = subprocess.run(
+                    git_cmd + ["diff", "--no-index", "--binary", "--", "/dev/null", file_relpath],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if untracked.stdout:
+                    chunks.append(untracked.stdout)
+            except Exception:
+                continue
+
+    if not chunks:
+        return None
+
+    from datetime import datetime, timezone
+
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        patch_path = backup_dir / datetime.now(timezone.utc).strftime(
+            "hermes-local-patches-%Y%m%d-%H%M%S.patch"
+        )
+        body = "\n".join(chunk.rstrip() for chunk in chunks if chunk.strip()) + "\n"
+        if skipped:
+            body += "\n# Skipped sensitive-looking untracked path(s):\n"
+            for relpath in skipped:
+                body += f"# - {relpath}\n"
+        patch_path.write_text(body, encoding="utf-8")
+    except OSError:
+        return None
+
+    print(f"  ✓ Saved local code patch: {patch_path}")
+    if skipped:
+        print(f"  ⚠ Skipped {len(skipped)} sensitive-looking untracked file(s) in patch capture")
+    return patch_path
+
+
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
@@ -7554,6 +7677,8 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     )
     if not status.stdout.strip():
         return None
+
+    _capture_local_update_patch(git_cmd, cwd, status.stdout)
 
     # If the index has unmerged entries (e.g. from an interrupted merge/rebase),
     # git stash will fail with "needs merge / could not write index".  Clear the

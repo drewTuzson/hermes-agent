@@ -80,6 +80,51 @@ def _error(message: str) -> dict:
     return {"error": _sanitize_error_text(message)}
 
 
+def _telegram_exception_chain(exc: Exception) -> list[BaseException]:
+    """Return ``exc`` plus nested causes/contexts, guarding against cycles."""
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    chain: list[BaseException] = []
+    while stack:
+        cur = stack.pop()
+        ident = id(cur)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        chain.append(cur)
+        cause = getattr(cur, "__cause__", None)
+        context = getattr(cur, "__context__", None)
+        if cause is not None:
+            stack.append(cause)
+        if context is not None:
+            stack.append(context)
+    return chain
+
+
+def _telegram_timeout_safely_retryable(exc: Exception) -> bool:
+    """True for Telegram timeout failures where the request was not sent.
+
+    A generic Telegram ``TimedOut`` can mean Telegram received the request but
+    the response was lost, so blindly retrying may duplicate a message. Wrapped
+    connect-timeouts and httpx pool timeouts are different: no TCP connection
+    was established, or PTB/httpx explicitly says the request was not sent.
+    Those are safe to retry and are the failure mode behind dropped cron
+    deliveries during Telegram reconnect storms.
+    """
+    for cur in _telegram_exception_chain(exc):
+        name = cur.__class__.__name__.lower()
+        text = str(cur).lower()
+        if "connecttimeout" in name or "connect timeout" in text or "connect timed out" in text:
+            return True
+        if "pooltimeout" in name or "pool timeout" in text or (
+            "connection pool" in text and "occupied" in text
+        ):
+            return True
+        if "request was *not* sent" in text or "request was not sent" in text:
+            return True
+    return False
+
+
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
     retry_after = getattr(exc, "retry_after", None)
     if retry_after is not None:
@@ -90,9 +135,16 @@ def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
 
     text = str(exc).lower()
     if "timed out" in text or "timeout" in text:
-        return None
+        return float(2 ** attempt) if _telegram_timeout_safely_retryable(exc) else None
     if (
-        "bad gateway" in text
+        "connecterror" in text
+        or "connect error" in text
+        or "connection error" in text
+        or "connection reset" in text
+        or "connection refused" in text
+        or "networkerror" in text
+        or "network error" in text
+        or "bad gateway" in text
         or "502" in text
         or "too many requests" in text
         or "429" in text

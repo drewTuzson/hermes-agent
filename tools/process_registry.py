@@ -1490,7 +1490,34 @@ class ProcessRegistry:
 process_registry = ProcessRegistry()
 
 
-def format_process_notification(evt: dict) -> "str | None":
+def format_plain_english_summary(evt: dict) -> str:
+    """Return the standard short Plain-English Summary block for process events."""
+    evt_type = evt.get("type", "completion")
+    sid = evt.get("session_id", "unknown")
+    exit_code = evt.get("exit_code", "?")
+
+    if evt_type == "watch_match":
+        where = f"background process {sid} hit a watched output pattern and may need attention."
+        needs = "review the matched output and decide whether to steer, wait, or stop it."
+        next_move = "continue only after the matched condition is understood."
+    elif evt_type == "watch_disabled":
+        where = f"watch notifications for background process {sid} were disabled after repeated matches."
+        needs = "check the process if this repeated signal matters."
+        next_move = "use the process log or poll the process before taking action."
+    else:
+        where = f"background process {sid} finished with exit code {exit_code}."
+        needs = "review the output above for success, failure, or follow-up work."
+        next_move = "act on the result if it succeeded, or inspect logs/errors if it failed."
+
+    return (
+        "\n\nPlain-English Summary:\n"
+        f"- Where things stand: {where}\n"
+        f"- What Drew needs: {needs}\n"
+        f"- Next move: {next_move}"
+    )
+
+
+def format_process_notification(evt: dict) -> str:
     """Format a process notification event into a [IMPORTANT: ...] message.
 
     Handles completion events (notify_on_complete), watch pattern matches,
@@ -1499,9 +1526,10 @@ def format_process_notification(evt: dict) -> "str | None":
     evt_type = evt.get("type", "completion")
     _sid = evt.get("session_id", "unknown")
     _cmd = evt.get("command", "unknown")
+    summary = format_plain_english_summary(evt)
 
     if evt_type == "watch_disabled":
-        return f"[IMPORTANT: {evt.get('message', '')}]"
+        return f"[IMPORTANT: {evt.get('message', '')}{summary}]"
 
     if evt_type == "watch_match":
         _pat = evt.get("pattern", "?")
@@ -1515,7 +1543,7 @@ def format_process_notification(evt: dict) -> "str | None":
         )
         if _sup:
             text += f"\n({_sup} earlier matches were suppressed by rate limit)"
-        text += "]"
+        text += f"{summary}]"
         return text
 
     _exit = evt.get("exit_code", "?")
@@ -1524,7 +1552,7 @@ def format_process_notification(evt: dict) -> "str | None":
         f"[IMPORTANT: Background process {_sid} completed "
         f"(exit code {_exit}).\n"
         f"Command: {_cmd}\n"
-        f"Output:\n{_out}]"
+        f"Output:\n{_out}{summary}]"
     )
 
 

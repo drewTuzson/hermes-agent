@@ -15731,12 +15731,14 @@ class GatewayRunner:
                         _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
                     else:
                         _out = _raw
-                    synth_text = (
-                        f"[IMPORTANT: Background process {session_id} completed "
-                        f"(exit code {session.exit_code}).\n"
-                        f"Command: {session.command}\n"
-                        f"Output:\n{_out}]"
-                    )
+                    from tools.process_registry import format_process_notification
+                    synth_text = format_process_notification({
+                        "type": "completion",
+                        "session_id": session_id,
+                        "command": getattr(session, "command", "unknown"),
+                        "exit_code": session.exit_code,
+                        "output": _out,
+                    })
                     source = self._build_process_event_source({
                         "session_id": session_id,
                         "session_key": session_key,
@@ -15786,10 +15788,18 @@ class GatewayRunner:
                     or (notify_mode == "error" and session.exit_code not in {0, None})
                 )
                 if should_notify:
+                    from tools.process_registry import format_plain_english_summary
                     new_output = session.output_buffer[-1000:] if session.output_buffer else ""
+                    _summary = format_plain_english_summary({
+                        "type": "completion",
+                        "session_id": session_id,
+                        "command": getattr(session, "command", "unknown"),
+                        "exit_code": session.exit_code,
+                        "output": new_output,
+                    })
                     message_text = (
                         f"[Background process {session_id} finished with exit code {session.exit_code}~ "
-                        f"Here's the final output:\n{new_output}]"
+                        f"Here's the final output:\n{new_output}{_summary}]"
                     )
                     adapter = None
                     for p, a in self.adapters.items():
@@ -19605,6 +19615,23 @@ def main():
             data = yaml.safe_load(f) or {}
             config = GatewayConfig.from_dict(data)
     
+    # Trust-boundary boot fail-safe: if any guarded permission key has drifted off its
+    # safe default with no valid root-owned marker, restore the safe default and log
+    # loudly before the gateway (and the agent loop) start. Fail-SAFE: drift becomes a
+    # logged self-heal, never an outage. Wrapped so the fail-safe itself can never block
+    # startup.
+    try:
+        from agent.config_write_policy import snap_back_guarded_keys
+        _restored = snap_back_guarded_keys(fail_closed=False)
+        if _restored:
+            print(f"[trust-boundary] snapped {len(_restored)} guarded key(s) back to safe default at boot")
+    except Exception as _snapback_err:
+        try:
+            import logging as _logging
+            _logging.getLogger("gateway.run").warning("Boot snap-back skipped: %s", _snapback_err)
+        except Exception:
+            pass
+
     # Run the gateway - exit with code 1 if no platforms connected,
     # so systemd Restart=on-failure will retry on transient errors (e.g. DNS)
     success = asyncio.run(start_gateway(config))

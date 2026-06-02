@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 from subprocess import CalledProcessError
 from types import SimpleNamespace
@@ -45,9 +46,9 @@ def test_stash_local_changes_if_needed_returns_specific_stash_commit(monkeypatch
     stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
 
     assert stash_ref == "abc123"
-    assert calls[1][0][-2:] == ["ls-files", "--unmerged"]
-    assert calls[2][0][1:4] == ["stash", "push", "--include-untracked"]
-    assert calls[3][0][-3:] == ["rev-parse", "--verify", "refs/stash"]
+    assert any(cmd[-2:] == ["ls-files", "--unmerged"] for cmd, _ in calls)
+    assert any(cmd[1:4] == ["stash", "push", "--include-untracked"] for cmd, _ in calls)
+    assert calls[-1][0][-3:] == ["rev-parse", "--verify", "refs/stash"]
 
 
 def test_resolve_stash_selector_returns_matching_entry(monkeypatch, tmp_path):
@@ -289,6 +290,68 @@ def test_stash_local_changes_if_needed_raises_when_stash_ref_missing(monkeypatch
 
     with pytest.raises(CalledProcessError):
         hermes_main._stash_local_changes_if_needed(["git"], Path(tmp_path))
+
+
+def test_capture_local_update_patch_saves_tracked_and_safe_untracked_changes(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+
+    tracked = repo / "hermes_cli" / "main.py"
+    tracked.parent.mkdir()
+    tracked.write_text("old = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "hermes_cli/main.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+    tracked.write_text("old = 2\n", encoding="utf-8")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "new_test.py").write_text("def test_new():\n    assert True\n", encoding="utf-8")
+    (repo / ".env.local").write_text("TOKEN=secret\n", encoding="utf-8")
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(hermes_main, "get_hermes_home", lambda: home)
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    patch_path = hermes_main._capture_local_update_patch(["git"], repo, status)
+
+    assert patch_path is not None
+    assert patch_path.parent == home / "update-backups"
+    body = patch_path.read_text(encoding="utf-8")
+    assert "old = 1" in body
+    assert "old = 2" in body
+    assert "tests/new_test.py" in body
+    assert "def test_new" in body
+    assert "TOKEN=secret" not in body
+    assert "# - .env.local" in body
+
+
+def test_capture_local_update_patch_returns_none_when_only_sensitive_untracked(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    (repo / "auth.json").write_text('{"token":"secret"}\n', encoding="utf-8")
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(hermes_main, "get_hermes_home", lambda: home)
+
+    patch_path = hermes_main._capture_local_update_patch(["git"], repo, "?? auth.json\n")
+
+    assert patch_path is None
+    assert not (home / "update-backups").exists()
 
 
 # ---------------------------------------------------------------------------

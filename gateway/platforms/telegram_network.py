@@ -231,9 +231,16 @@ async def discover_fallback_ips() -> list[str]:
         logger.debug("Discovered Telegram fallback IPs via DoH: %s", ", ".join(validated))
         return validated
 
+    system_fallbacks = _normalize_fallback_ips(sorted(system_ips))
+    if system_fallbacks:
+        logger.info(
+            "DoH discovery yielded no usable IPs; using system DNS Telegram fallback IPs %s",
+            ", ".join(system_fallbacks),
+        )
+        return system_fallbacks
+
     logger.info(
-        "DoH discovery yielded no usable IPs (system DNS: %s); using seed fallback IPs %s",
-        ", ".join(system_ips) or "unknown",
+        "DoH discovery yielded no usable IPs (system DNS: unknown); using seed fallback IPs %s",
         ", ".join(_SEED_FALLBACK_IPS),
     )
     return list(_SEED_FALLBACK_IPS)
