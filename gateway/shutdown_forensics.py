@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -70,10 +71,60 @@ def _read_proc_cmdline(pid: int) -> Optional[str]:
     return data.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
 
 
+def _ps_summary_macos(pid: int) -> Dict[str, Any]:
+    """macOS/BSD fallback for :func:`_proc_summary` using ``ps``.
+
+    There is no ``/proc`` on macOS, so the Linux probe returns nothing and
+    every shutdown context logs ``parent_name=? parent_cmdline=(unknown)``.
+    ``ps`` is always present and cheap for a single PID. Best-effort; never
+    raises. Returns a dict with whatever fields we could resolve.
+    """
+    summary: Dict[str, Any] = {"pid": pid}
+    if pid <= 0:
+        return summary
+    try:
+        # -o with '=' headers suppresses the header row. Fields: ppid, state,
+        # uid, comm (short name), command (full argv). Order matters for parse.
+        result = subprocess.run(
+            ["ps", "-o", "ppid=,state=,uid=,comm=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return summary
+    if result.returncode != 0 or not result.stdout.strip():
+        return summary
+    parts = result.stdout.split(None, 3)
+    if len(parts) >= 1 and parts[0].isdigit():
+        summary["ppid"] = int(parts[0])
+    if len(parts) >= 2:
+        summary["state"] = parts[1]
+    if len(parts) >= 3 and parts[2].isdigit():
+        summary["uid"] = parts[2]
+    if len(parts) >= 4:
+        summary["name"] = parts[3].strip()
+    # Full command line in a separate call so a long argv can't break the
+    # column split above.
+    try:
+        cmd_result = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        if cmd_result.returncode == 0 and cmd_result.stdout.strip():
+            summary["cmdline"] = cmd_result.stdout.strip()[:300]
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return summary
+
+
 def _proc_summary(pid: int) -> Dict[str, Any]:
     """Compact /proc/<pid> snapshot: pid, ppid, state, uid, cmdline.
 
     Best-effort.  Missing fields are simply omitted rather than raising.
+    On platforms without ``/proc`` (macOS/BSD), falls back to ``ps``.
     """
     summary: Dict[str, Any] = {"pid": pid}
     if pid <= 0:
@@ -98,6 +149,14 @@ def _proc_summary(pid: int) -> Dict[str, Any]:
     if cmdline:
         # Truncate aggressively — these can be 4KB
         summary["cmdline"] = cmdline[:300]
+    # If /proc gave us nothing useful (macOS/BSD: no /proc at all), fall back
+    # to ps so the shutdown context can still name the parent process.
+    if "cmdline" not in summary and "name" not in summary:
+        if sys.platform != "win32":
+            ps_summary = _ps_summary_macos(pid)
+            # Merge ps fields without clobbering anything we already have.
+            for k, v in ps_summary.items():
+                summary.setdefault(k, v)
     return summary
 
 
@@ -226,19 +285,41 @@ def spawn_async_diagnostic(
     if sys.platform == "win32":
         return None
 
-    script = (
-        f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
-        "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
-        "echo '--- ps auxf (top 60 by cpu) ---'; "
-        "ps auxf --sort=-pcpu 2>/dev/null | head -60; "
-        "echo '--- pstree of self ---'; "
-        f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || true; "
-        "echo '--- /proc/loadavg ---'; "
-        "cat /proc/loadavg 2>/dev/null || true; "
-        "echo '--- recent dmesg (oom/killed) ---'; "
-        "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
-        "echo '=== end ==='"
-    )
+    if sys.platform == "darwin":
+        # macOS/BSD: no /proc, no pstree, no dmesg, GNU ps flags differ.
+        # Use BSD ps + log show (jetsam/low-memory kills) + sysctl loadavg.
+        script = (
+            f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
+            "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
+            "echo '--- ps (top 60 by cpu) ---'; "
+            "ps -Ao pid,ppid,stat,%cpu,%mem,etime,command -r 2>/dev/null | head -60; "
+            "echo '--- self + ancestry ---'; "
+            f"ps -o pid,ppid,stat,etime,command -p {os.getpid()} 2>/dev/null; "
+            "echo '--- loadavg ---'; "
+            "sysctl -n vm.loadavg 2>/dev/null || true; "
+            "echo '--- launchd gateway job state ---'; "
+            "launchctl print gui/$(id -u)/ai.hermes.gateway 2>/dev/null "
+            "| grep -iE 'state =|pid =|last exit|runs =' | head -8 || true; "
+            "echo '--- recent jetsam / low-memory kills (5m) ---'; "
+            "log show --last 5m --predicate "
+            "'eventMessage CONTAINS \"jetsam\" OR eventMessage CONTAINS \"memorystatus\" "
+            "OR eventMessage CONTAINS \"lowswap\"' --style compact 2>/dev/null | tail -20 || true; "
+            "echo '=== end ==='"
+        )
+    else:
+        script = (
+            f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
+            "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
+            "echo '--- ps auxf (top 60 by cpu) ---'; "
+            "ps auxf --sort=-pcpu 2>/dev/null | head -60; "
+            "echo '--- pstree of self ---'; "
+            f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || true; "
+            "echo '--- /proc/loadavg ---'; "
+            "cat /proc/loadavg 2>/dev/null || true; "
+            "echo '--- recent dmesg (oom/killed) ---'; "
+            "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
+            "echo '=== end ==='"
+        )
 
     try:
         # Open the log file in append mode and let the subprocess inherit.
@@ -249,13 +330,33 @@ def spawn_async_diagnostic(
         return None
 
     try:
+        # Prefer a `timeout` wrapper so a wedged ps/log command self-cleans.
+        # Linux ships GNU `timeout`; macOS ships neither by default but may
+        # have `gtimeout` from coreutils. If no timeout binary exists (common
+        # on stock macOS), fall back to bash with an internal watchdog that
+        # kills the script's own process group after the deadline — so we
+        # never leak a hung diagnostic.
+        timeout_bin = shutil.which("timeout") or shutil.which("gtimeout")
+        if timeout_bin:
+            argv = [timeout_bin, f"{timeout_seconds:.0f}", "bash", "-c", script]
+        else:
+            guarded = (
+                f"( {script} ) & "
+                "diag_pid=$!; "
+                f"( sleep {timeout_seconds:.0f}; kill -TERM $diag_pid 2>/dev/null ) & "
+                "watch_pid=$!; "
+                "wait $diag_pid 2>/dev/null; "
+                "kill -TERM $watch_pid 2>/dev/null; "
+                "true"
+            )
+            argv = ["bash", "-c", guarded]
         # Detach from our process group so the subprocess survives even
         # if systemd kills our cgroup with KillMode=control-group (which
         # would also reap us anyway, but defense in depth).  Without
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            argv,
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

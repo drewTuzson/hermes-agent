@@ -3012,6 +3012,24 @@ def generate_launchd_plist() -> str:
     working_dir = _stable_service_working_dir()
     hermes_home = str(get_hermes_home().resolve())
     launchd_home = str(_launchd_user_home())
+    # ExitTimeOut: launchd defaults to 20s between SIGTERM and SIGKILL. The
+    # gateway drains active turns for up to ``agent.restart_drain_timeout``
+    # seconds (default 180). Without an explicit ExitTimeOut, launchd SIGKILLs
+    # (-9) the gateway mid-drain at 20s, shredding the in-flight conversation
+    # turn and producing a "phantom kill" (LastExitStatus=-9) that KeepAlive
+    # then respawns. Size ExitTimeOut to drain_timeout + 30s of slack so the
+    # graceful drain always wins. Read config directly to avoid importing the
+    # gateway runtime here.
+    _drain_timeout = 180.0
+    try:
+        _cfg = read_raw_config()
+        _agent_cfg = _cfg.get("agent", {}) if isinstance(_cfg, dict) else {}
+        _raw = _agent_cfg.get("restart_drain_timeout") if isinstance(_agent_cfg, dict) else None
+        if _raw is not None and str(_raw).strip():
+            _drain_timeout = float(_raw)
+    except Exception:
+        _drain_timeout = 180.0
+    exit_timeout = int(_drain_timeout) + 30
     log_dir = get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
@@ -3090,7 +3108,10 @@ def generate_launchd_plist() -> str:
         <key>SuccessfulExit</key>
         <false/>
     </dict>
-    
+
+    <key>ExitTimeOut</key>
+    <integer>{exit_timeout}</integer>
+
     <key>StandardOutPath</key>
     <string>{log_dir}/gateway.log</string>
     
